@@ -10,6 +10,7 @@ from analytics import build_response
 from auth import router as auth_router
 from db import init_db
 from expenses import router as expenses_router
+from imports import router as imports_router
 
 app = FastAPI(title="Expense Categorizer API")
 app.add_middleware(
@@ -22,6 +23,7 @@ app.add_middleware(
 init_db()
 app.include_router(auth_router)
 app.include_router(expenses_router)
+app.include_router(imports_router)
 
 model = joblib.load("model.joblib")
 

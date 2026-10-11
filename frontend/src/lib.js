@@ -10,7 +10,14 @@ export const CAT_COLORS = {
   Health: "#4CB963",
   Education: "#8E5572",
   Transfers: "#5A6784",
+  Investments: "#2E86AB",
+  "Loans / EMI": "#8C3B2F",
+  Contacts: "#C97B84",
+  Other: "#9AA3B5",
 };
+
+// Money received is shown in its own section, so it is not part of the spending categories.
+export const CREDIT_COLOR = "#3C9D5D";
 
 const inrFmt = new Intl.NumberFormat("en-IN", {
   style: "currency",

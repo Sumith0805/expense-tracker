@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { API, CAT_COLORS, fmtDate, inr, inrExact } from "./lib";
+import { API, CAT_COLORS, CREDIT_COLOR, fmtDate, inr, inrExact } from "./lib";
 import { call, loadSession, saveSession } from "./api";
 import AnimatedAmount from "./AnimatedAmount";
 import AuthPage from "./AuthPage";
@@ -73,6 +73,8 @@ export default function App() {
   const [flash, setFlash] = useState(null);
   const flashTimer = useRef(null);
   const fileRef = useRef(null);
+  const pdfRef = useRef(null);
+  const [importInfo, setImportInfo] = useState(null);
 
   const token = session?.token;
 
@@ -145,6 +147,7 @@ export default function App() {
         throw new Error(j.detail || "The server could not read that file.");
       }
       setData(await res.json());
+      setImportInfo(null);
       setCat(null);
       setMonth(null);
       setQuery("");
@@ -156,6 +159,69 @@ export default function App() {
           ? "Can't reach the analysis server. Check that the API is running on port 8000."
           : e.message
       );
+    } finally {
+      clearTimeout(timer);
+      setSlow(false);
+      setBusy(false);
+    }
+  }
+
+  async function importPdfs(list) {
+    const files = Array.from(list || []).filter((f) => /\.pdf$/i.test(f.name));
+    if (!files.length) {
+      setError("Please choose a statement in PDF format.");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    setSlow(false);
+    const timer = setTimeout(() => setSlow(true), 4000);
+    try {
+      const body = new FormData();
+      files.forEach((f) => body.append("files", f));
+      if (data) {
+        // Send the current list back so the new PDF is added to it and repeats are skipped.
+        body.append(
+          "existing",
+          JSON.stringify({
+            transactions: txns.map((t) => ({
+              date: t.date,
+              description: String(t.description),
+              amount: t.amount,
+              category: t.category,
+              payee: t.payee || "",
+              account: t.account || "",
+              ref: t.ref || "",
+              source: overrides[t._i] ? "user" : t.source || "",
+            })),
+            credits: data.credits || [],
+          })
+        );
+      }
+      const res = await fetch(`${API}/import/statements`, {
+        method: "POST",
+        body,
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({}));
+        throw new Error(typeof j.detail === "string" ? j.detail : "The server could not read that PDF.");
+      }
+      const j = await res.json();
+      setData(j);
+      setImportInfo(j.import || null);
+      setCat(null);
+      setMonth(null);
+      setQuery("");
+      setOverrides({});
+      go("/results");
+    } catch (e) {
+      const msg =
+        e.message === "Failed to fetch"
+          ? "Can't reach the analysis server. Check that the API is running on port 8000."
+          : e.message;
+      setError(msg);
+      say(msg);
     } finally {
       clearTimeout(timer);
       setSlow(false);
@@ -183,6 +249,7 @@ export default function App() {
       return;
     }
     setData(res);
+    setImportInfo(null);
     setCat(null);
     setMonth(null);
     setQuery("");
@@ -192,12 +259,28 @@ export default function App() {
 
   async function saveToAccount() {
     setSaving(true);
-    const payload = txns.map((t) => ({
-      date: t.date,
-      description: String(t.description),
-      amount: t.amount,
-      category: t.category,
-    }));
+    const payload = [
+      ...txns.map((t) => ({
+        date: t.date,
+        description: String(t.description),
+        amount: t.amount,
+        category: t.category,
+        payee: t.payee || "",
+        account: t.account || "",
+        ref: t.ref || "",
+        kind: "expense",
+      })),
+      ...(data?.credits || []).map((c) => ({
+        date: c.date,
+        description: String(c.description),
+        amount: c.amount,
+        category: "Credited",
+        payee: c.payee || "",
+        account: c.account || "",
+        ref: c.ref || "",
+        kind: "credit",
+      })),
+    ];
     const res = await authed(() => call("/expenses", { method: "PUT", body: payload, token }));
     setSaving(false);
     if (res) say(`Saved ${res.saved} transactions to your account.`);
@@ -226,6 +309,7 @@ export default function App() {
 
   function clearData() {
     setData(null);
+    setImportInfo(null);
     setOverrides({});
     setCat(null);
     setMonth(null);
@@ -315,6 +399,7 @@ export default function App() {
         ))}
       </select>
       {overrides[t._i] && <small className="edited">edited</small>}
+      {t.needs_review && !overrides[t._i] && <small className="edited">check</small>}
     </span>
   );
 
@@ -323,8 +408,76 @@ export default function App() {
 
   const editedCount = Object.keys(overrides).length;
 
+  const credits = useMemo(() => {
+    const all = data?.credits || [];
+    return month ? all.filter((c) => String(c.date).startsWith(month)) : all;
+  }, [data, month]);
+  const creditTotal = useMemo(() => credits.reduce((s, c) => s + c.amount, 0), [credits]);
+  const byAccount = useMemo(() => {
+    const m = {};
+    credits.forEach((c) => {
+      const k = c.account || "";
+      m[k] = m[k] || { amt: 0, n: 0 };
+      m[k].amt += c.amount;
+      m[k].n += 1;
+    });
+    return Object.entries(m).sort((a, b) => b[1].amt - a[1].amt);
+  }, [credits]);
+  const bySender = useMemo(() => {
+    const m = {};
+    credits.forEach((c) => {
+      m[c.description] = m[c.description] || { amt: 0, n: 0 };
+      m[c.description].amt += c.amount;
+      m[c.description].n += 1;
+    });
+    return Object.entries(m).sort((a, b) => b[1].amt - a[1].amt).slice(0, 5);
+  }, [credits]);
+  const people = useMemo(() => {
+    const m = {};
+    scoped.forEach((t) => {
+      if (t.category !== "Contacts" && t.category !== "Transfers") return;
+      m[t.description] = m[t.description] || { amt: 0, n: 0, cat: t.category };
+      m[t.description].amt += t.amount;
+      m[t.description].n += 1;
+    });
+    return Object.entries(m).sort((a, b) => b[1].amt - a[1].amt).slice(0, 8);
+  }, [scoped]);
+
+  const importNote = importInfo
+    ? [
+        `Added ${importInfo.added} payments and ${importInfo.credits_added} credits from ${importInfo.files} ${
+          importInfo.files === 1 ? "PDF" : "PDFs"
+        }.`,
+        importInfo.duplicates ? `${importInfo.duplicates} were already in your list and were skipped.` : "",
+        importInfo.own_transfers
+          ? `${importInfo.own_transfers} transfers between your own accounts were left out.`
+          : "",
+        importInfo.refunded ? `${importInfo.refunded} entries that cancelled out as refunds were left out.` : "",
+        importInfo.to_check
+          ? `${importInfo.to_check} payments are marked "check" because their category is a guess.`
+          : "",
+        importInfo.read < importInfo.expected
+          ? `Only ${importInfo.read} of ${importInfo.expected} transactions could be read.`
+          : "",
+      ]
+        .filter(Boolean)
+        .join(" ")
+    : "";
+
   return (
     <div className="wrap">
+      <input
+        ref={pdfRef}
+        type="file"
+        accept=".pdf,application/pdf"
+        multiple
+        hidden
+        onChange={(e) => {
+          const picked = Array.from(e.target.files || []);
+          e.target.value = "";
+          if (picked.length) importPdfs(picked);
+        }}
+      />
       <header className="topbar">
         <div className="topbar-left">
           {view !== "home" && (
@@ -372,7 +525,7 @@ export default function App() {
         <main>
           <h1 className="headline">Find out where your money goes each month.</h1>
           <p className="lede">
-            Drop in a bank or UPI statement as a CSV, or type your expenses in. Kharcha sorts
+            Drop in a bank or UPI statement as a CSV or a PDF, or type your expenses in. Kharcha sorts
             every transaction into a category and flags the ones that look unusual.
           </p>
 
@@ -403,15 +556,20 @@ export default function App() {
             onDrop={(e) => {
               e.preventDefault();
               setOver(false);
-              const f = e.dataTransfer.files[0];
-              if (f) analyze(f);
+              const files = Array.from(e.dataTransfer.files);
+              if (!files.length) return;
+              if (files.every((f) => /\.pdf$/i.test(f.name))) importPdfs(files);
+              else analyze(files[0]);
             }}
           >
-            <p className="drop-title">{busy ? "Reading your statement…" : "Drop a CSV here"}</p>
-            <span>It needs date, description and amount columns.</span>
+            <p className="drop-title">{busy ? "Reading your statement…" : "Drop a CSV or PDF here"}</p>
+            <span>A CSV needs date, description and amount columns. A PDF is read as it is.</span>
             <div className="drop-actions">
               <button className="btn" disabled={busy} onClick={() => fileRef.current.click()}>
                 Choose a file
+              </button>
+              <button className="btn ghost" disabled={busy} onClick={() => pdfRef.current.click()}>
+                Add PDF
               </button>
               <button className="btn ghost" disabled={busy} onClick={useSample}>
                 Use sample data
@@ -519,6 +677,89 @@ export default function App() {
             dark={dark}
           />
           <Unusual items={data.anomalies} />
+
+          {credits.length > 0 && (
+            <section className="section">
+              <h2>Money received</h2>
+              <p className="sub">
+                {inr(creditTotal)} came in across {credits.length}{" "}
+                {credits.length === 1 ? "payment" : "payments"}
+                {month ? ` in ${monthLabel(month)}` : ""}. It is not counted in what you spent. Here is where it
+                landed.
+              </p>
+              <ul className="unusual">
+                {byAccount.map(([acct, v]) => (
+                  <li key={acct || "none"}>
+                    <span className="dot" style={{ background: CREDIT_COLOR }} />
+                    <span className="u-desc">
+                      {acct ? `Account ending ${acct}` : "Account not shown"}
+                      <small>
+                        {v.n} {v.n === 1 ? "payment" : "payments"} received
+                      </small>
+                    </span>
+                    <span className="num">{inrExact(v.amt)}</span>
+                  </li>
+                ))}
+              </ul>
+              <p className="sub">Biggest senders</p>
+              <ul className="unusual">
+                {bySender.map(([name, v]) => (
+                  <li key={name}>
+                    <span className="dot" style={{ background: CREDIT_COLOR }} />
+                    <span className="u-desc">
+                      {name}
+                      <small>
+                        {v.n} {v.n === 1 ? "payment" : "payments"}
+                      </small>
+                    </span>
+                    <span className="num">{inrExact(v.amt)}</span>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+
+          {people.length > 0 && (
+            <section className="section">
+              <h2>People you paid</h2>
+              <p className="sub">
+                Payments to individuals, from the Contacts and Transfers categories. If one is really food or
+                rent, change its category in the table below.
+              </p>
+              <ul className="unusual">
+                {people.map(([name, v]) => (
+                  <li key={name}>
+                    <span className="dot" style={{ background: CAT_COLORS[v.cat] || "#5a6784" }} />
+                    <span className="u-desc">
+                      {name}
+                      <small>
+                        {v.n} {v.n === 1 ? "payment" : "payments"} · {v.cat}
+                      </small>
+                    </span>
+                    <span className="num">{inrExact(v.amt)}</span>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+
+          <section className="section">
+            <h2>Statement PDFs</h2>
+            <p className="sub">
+              {importNote ||
+                "Add a statement PDF to bring in your payments and the money you received. Transfers between your own accounts are skipped, and refunds cancel out."}
+            </p>
+            <div className="tools">
+              <button className="btn ghost" disabled={busy} onClick={() => pdfRef.current.click()}>
+                {busy ? "Reading your PDF…" : "Add PDF"}
+              </button>
+            </div>
+            {busy && slow && (
+              <p className="note" role="status">
+                The server is waking up. The first request can take up to a minute.
+              </p>
+            )}
+          </section>
 
           <section className="section">
             <h2>Transactions</h2>

@@ -2,23 +2,18 @@ from datetime import datetime
 from math import isfinite
 from typing import List
 
-import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from analytics import build_response
 from auth import current_user
 from db import Expense, User, get_db
+from ledger import CATEGORIES, CREDIT_CATEGORY, full_response
 
 router = APIRouter(prefix="/expenses", tags=["expenses"])
 
 MAX_ROWS = 5000
-CATEGORIES = {
-    "Food", "Groceries", "Transport", "Shopping", "Bills",
-    "Entertainment", "Health", "Education", "Transfers",
-}
 
 
 class Row(BaseModel):
@@ -26,6 +21,10 @@ class Row(BaseModel):
     description: str
     amount: float
     category: str
+    payee: str = ""
+    account: str = ""
+    ref: str = ""
+    kind: str = "expense"
 
 
 def check(r: Row):
@@ -35,7 +34,12 @@ def check(r: Row):
         raise HTTPException(status_code=400, detail="A transaction has an invalid date.")
     if not isfinite(r.amount) or r.amount <= 0 or r.amount > 1e9:
         raise HTTPException(status_code=400, detail="A transaction has an invalid amount.")
-    if r.category not in CATEGORIES:
+    if r.kind not in ("expense", "credit"):
+        raise HTTPException(status_code=400, detail="A transaction has an unknown type.")
+    if r.kind == "credit":
+        if r.category != CREDIT_CATEGORY:
+            raise HTTPException(status_code=400, detail="A credit has an unknown category.")
+    elif r.category not in CATEGORIES:
         raise HTTPException(status_code=400, detail="A transaction has an unknown category.")
 
 
@@ -58,12 +62,28 @@ def replace_all(
                 description=r.description[:300],
                 amount=r.amount,
                 category=r.category,
+                kind=r.kind,
+                account=r.account[:8],
+                payee=r.payee[:120],
+                ref=r.ref[:32],
             )
             for r in rows
         ]
     )
     db.commit()
     return {"saved": len(rows)}
+
+
+def _as_dict(e: Expense):
+    return {
+        "date": e.date,
+        "description": e.description,
+        "amount": e.amount,
+        "category": e.category,
+        "payee": e.payee or "",
+        "account": e.account or "",
+        "ref": e.ref or "",
+    }
 
 
 @router.get("/analysis")
@@ -73,13 +93,9 @@ def my_analysis(user: User = Depends(current_user), db: Session = Depends(get_db
     ).all()
     if not items:
         return {"rows": 0}
-    df = pd.DataFrame(
-        [
-            {"date": e.date, "description": e.description, "amount": e.amount, "category": e.category}
-            for e in items
-        ]
-    )
-    return build_response(df)
+    spend = [_as_dict(e) for e in items if (e.kind or "expense") != "credit"]
+    credits = [_as_dict(e) for e in items if e.kind == "credit"]
+    return full_response(spend, credits)
 
 
 @router.delete("")
