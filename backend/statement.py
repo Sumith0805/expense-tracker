@@ -86,6 +86,22 @@ def categorize(name: str, amount: float):
     return None, "none"
 
 
+def fill_unknown(expenses, predict=None):
+    """Merchants no rule recognises get the model's guess, or 'Other' when there is no model."""
+    unknown = [e for e in expenses if e["category"] is None]
+    if not unknown:
+        return
+    guesses = []
+    if predict is not None:
+        try:
+            guesses = list(predict([e["description"].lower() for e in unknown]))
+        except Exception:
+            guesses = []
+    for i, e in enumerate(unknown):
+        e["category"] = str(guesses[i]) if i < len(guesses) else "Other"
+        e["source"] = "model" if i < len(guesses) else "none"
+
+
 def parse(data: bytes, predict=None) -> dict:
     """predict: optional function(list_of_descriptions) -> list_of_categories for unknown merchants."""
     text = pdf_text(data)
@@ -138,17 +154,7 @@ def parse(data: bytes, predict=None) -> dict:
             row.update(category=cat, source=source)
             expenses.append(row)
 
-    unknown = [e for e in expenses if e["category"] is None]
-    if unknown:
-        guesses = []
-        if predict is not None:
-            try:
-                guesses = list(predict([e["description"].lower() for e in unknown]))
-            except Exception:
-                guesses = []
-        for i, e in enumerate(unknown):
-            e["category"] = str(guesses[i]) if i < len(guesses) else "Other"
-            e["source"] = "model" if i < len(guesses) else "none"
+    fill_unknown(expenses, predict)
 
     return {
         "expenses": expenses,

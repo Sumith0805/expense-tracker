@@ -1,4 +1,4 @@
-"""Add statement PDFs to the current list of transactions."""
+"""Add statement PDFs or bank SMS to the current list of transactions."""
 import json
 import math
 from collections import Counter, defaultdict
@@ -9,10 +9,12 @@ from typing import List, Optional
 import joblib
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.security import HTTPAuthorizationCredentials
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
+import sms
 import statement
 from auth import bearer, current_user
 from db import Expense, User, get_db
@@ -78,17 +80,43 @@ def clean_row(x, kind):
     }
 
 
-def load_existing(raw: str):
-    if not raw.strip():
-        return [], []
-    try:
-        obj = json.loads(raw)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Could not read your current list. Please try again.")
+def clean_existing(obj):
     if not isinstance(obj, dict):
         return [], []
     spend = [r for r in (clean_row(x, "expense") for x in obj.get("transactions") or []) if r]
     credits = [r for r in (clean_row(x, "credit") for x in obj.get("credits") or []) if r]
+    return spend, credits
+
+
+def load_existing(raw: str):
+    if not raw.strip():
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Could not read your current list. Please try again.")
+
+
+def saved_rows(db, user):
+    """What the signed-in user already saved, used when nothing is open on screen."""
+    items = db.scalars(select(Expense).where(Expense.user_id == user.id).order_by(Expense.date)).all()
+    spend, credits = [], []
+    for e in items:
+        kind = "credit" if e.kind == "credit" else "expense"
+        row = clean_row(
+            {
+                "date": e.date,
+                "description": e.description,
+                "amount": e.amount,
+                "category": e.category,
+                "payee": e.payee or "",
+                "account": e.account or "",
+                "ref": e.ref or "",
+            },
+            kind,
+        )
+        if row:
+            (credits if kind == "credit" else spend).append(row)
     return spend, credits
 
 
@@ -110,8 +138,8 @@ def learned_categories(db, user, existing_spend):
     return {payee: c.most_common(1)[0][0] for payee, c in votes.items()}
 
 
-def merge_import(parsed, old_spend, old_credits, memory):
-    """Combine freshly parsed statements with what is already on screen. Pure function, no I/O."""
+def merge_import(parsed, old_spend, old_credits, memory, source="pdf"):
+    """Combine freshly parsed rows with what is already on screen. Pure function, no I/O."""
     seen = {(r["kind"], r["ref"]) for r in old_spend + old_credits if r["ref"]}
     new_spend, new_credits, dups = [], [], 0
     for p in parsed:
@@ -140,17 +168,41 @@ def merge_import(parsed, old_spend, old_credits, memory):
         if remembered:
             r["category"], r["source"] = remembered, "memory"
     info = {
+        "source": source,
         "files": len(parsed),
         "added": len(new_spend),
         "credits_added": len(new_credits),
         "duplicates": dups,
         "own_transfers": sum(p["skipped"]["own_transfers"] for p in parsed),
         "refunded": sum(p["skipped"]["refunded"] for p in parsed),
+        "ignored": sum(p.get("ignored", 0) for p in parsed),
         "to_check": sum(1 for r in new_spend if r["source"] in REVIEW_SOURCES),
         "read": sum(p["found"] for p in parsed),
         "expected": sum(p["expected"] for p in parsed),
     }
     return new_spend, new_credits, info
+
+
+def finish_import(parsed, existing_obj, user, db, source):
+    """Shared by the PDF and SMS endpoints."""
+    if existing_obj is None and user is not None:
+        old_spend, old_credits = saved_rows(db, user)  # add to what is already saved
+    else:
+        old_spend, old_credits = clean_existing(existing_obj)
+    memory = learned_categories(db, user, old_spend)
+    new_spend, new_credits, info = merge_import(parsed, old_spend, old_credits, memory, source)
+
+    spend, credits = old_spend + new_spend, old_credits + new_credits
+    if not spend and not credits:
+        raise HTTPException(
+            status_code=400,
+            detail="Nothing new to add. Everything was already in your list, or could not be read as a payment.",
+        )
+    if len(spend) + len(credits) > MAX_ROWS:
+        raise HTTPException(status_code=400, detail=f"That is more than {MAX_ROWS} transactions in total.")
+    resp = full_response(spend, credits)
+    resp["import"] = info
+    return resp
 
 
 @router.post("/statements")
@@ -174,24 +226,37 @@ async def import_statements(
         except statement.StatementError as e:
             raise HTTPException(status_code=400, detail=str(e))
     if not any(p["found"] for p in parsed):
+        raise HTTPException(status_code=400, detail="This PDF could not be read as a payment statement.")
+    return finish_import(parsed, load_existing(existing), user, db, "pdf")
+
+
+class SmsMessage(BaseModel):
+    sender: str = ""
+    body: str
+    date: int = 0
+
+
+class SmsImport(BaseModel):
+    messages: List[SmsMessage]
+    existing: Optional[dict] = None
+
+
+@router.post("/sms")
+async def import_sms(
+    payload: SmsImport,
+    user: Optional[User] = Depends(optional_user),
+    db: Session = Depends(get_db),
+):
+    if not payload.messages:
+        raise HTTPException(status_code=400, detail="No messages were sent.")
+    if len(payload.messages) > sms.MAX_MESSAGES:
+        raise HTTPException(status_code=400, detail=f"Send up to {sms.MAX_MESSAGES} messages at a time.")
+    parsed = await run_in_threadpool(
+        sms.parse_messages, [{"body": m.body} for m in payload.messages], predict
+    )
+    if not parsed["found"] and not parsed["skipped"]["own_transfers"]:
         raise HTTPException(
             status_code=400,
-            detail="This PDF could not be read as a payment statement.",
+            detail="None of these messages looked like a payment alert from a supported bank.",
         )
-
-    old_spend, old_credits = load_existing(existing)
-    memory = learned_categories(db, user, old_spend)
-    new_spend, new_credits, info = merge_import(parsed, old_spend, old_credits, memory)
-
-    spend, credits = old_spend + new_spend, old_credits + new_credits
-    if not spend and not credits:
-        raise HTTPException(
-            status_code=400,
-            detail="Nothing new to add. Every payment in this file was a transfer between your own accounts, a refund, or already in your list.",
-        )
-    if len(spend) + len(credits) > MAX_ROWS:
-        raise HTTPException(status_code=400, detail=f"That is more than {MAX_ROWS} transactions in total.")
-
-    resp = full_response(spend, credits)
-    resp["import"] = info
-    return resp
+    return finish_import([parsed], payload.existing, user, db, "sms")

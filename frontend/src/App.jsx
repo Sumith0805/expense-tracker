@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { Capacitor, registerPlugin } from "@capacitor/core";
 import { API, CAT_COLORS, CREDIT_COLOR, fmtDate, inr, inrExact } from "./lib";
 import { call, loadSession, saveSession } from "./api";
 import AnimatedAmount from "./AnimatedAmount";
@@ -40,6 +41,10 @@ function useRoute() {
 
   return [route, go, back];
 }
+
+// Reading bank SMS only exists in the Android app. On the website nothing about this shows.
+const SmsReader = registerPlugin("SmsReader");
+const onAndroidApp = Capacitor.getPlatform() === "android";
 
 export default function App() {
   const [route, go, back] = useRoute();
@@ -166,6 +171,22 @@ export default function App() {
     }
   }
 
+  function currentList() {
+    return {
+      transactions: txns.map((t) => ({
+        date: t.date,
+        description: String(t.description),
+        amount: t.amount,
+        category: t.category,
+        payee: t.payee || "",
+        account: t.account || "",
+        ref: t.ref || "",
+        source: overrides[t._i] ? "user" : t.source || "",
+      })),
+      credits: data?.credits || [],
+    };
+  }
+
   async function importPdfs(list) {
     const files = Array.from(list || []).filter((f) => /\.pdf$/i.test(f.name));
     if (!files.length) {
@@ -181,22 +202,7 @@ export default function App() {
       files.forEach((f) => body.append("files", f));
       if (data) {
         // Send the current list back so the new PDF is added to it and repeats are skipped.
-        body.append(
-          "existing",
-          JSON.stringify({
-            transactions: txns.map((t) => ({
-              date: t.date,
-              description: String(t.description),
-              amount: t.amount,
-              category: t.category,
-              payee: t.payee || "",
-              account: t.account || "",
-              ref: t.ref || "",
-              source: overrides[t._i] ? "user" : t.source || "",
-            })),
-            credits: data.credits || [],
-          })
-        );
+        body.append("existing", JSON.stringify(currentList()));
       }
       const res = await fetch(`${API}/import/statements`, {
         method: "POST",
@@ -219,6 +225,57 @@ export default function App() {
       const msg =
         e.message === "Failed to fetch"
           ? "Can't reach the analysis server. Check that the API is running on port 8000."
+          : e.message;
+      setError(msg);
+      say(msg);
+    } finally {
+      clearTimeout(timer);
+      setSlow(false);
+      setBusy(false);
+    }
+  }
+
+  async function syncSms() {
+    if (!onAndroidApp || busy) return;
+    setBusy(true);
+    setError("");
+    setSlow(false);
+    const timer = setTimeout(() => setSlow(true), 4000);
+    try {
+      let perm = await SmsReader.checkPermissions();
+      if (perm.sms !== "granted") perm = await SmsReader.requestPermissions();
+      if (perm.sms !== "granted") {
+        throw new Error(
+          "SMS access was not allowed. On your phone open Settings, Apps, Kharcha, Permissions and allow SMS."
+        );
+      }
+      const found = await SmsReader.readMessages({ days: 90 });
+      const messages = found.messages || [];
+      if (!messages.length) {
+        say("No bank payment messages were found in the last 90 days.");
+        return;
+      }
+      const res = await fetch(`${API}/import/sms`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        body: JSON.stringify({ messages, existing: data ? currentList() : null }),
+      });
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({}));
+        throw new Error(typeof j.detail === "string" ? j.detail : "The server could not read those messages.");
+      }
+      const j = await res.json();
+      setData(j);
+      setImportInfo(j.import || null);
+      setCat(null);
+      setMonth(null);
+      setQuery("");
+      setOverrides({});
+      go("/results");
+    } catch (e) {
+      const msg =
+        e.message === "Failed to fetch"
+          ? "Can't reach the analysis server. Check your internet connection and try again."
           : e.message;
       setError(msg);
       say(msg);
@@ -443,11 +500,14 @@ export default function App() {
     return Object.entries(m).sort((a, b) => b[1].amt - a[1].amt).slice(0, 8);
   }, [scoped]);
 
+  const importWhere = importInfo
+    ? importInfo.source === "sms"
+      ? "your bank messages"
+      : `${importInfo.files} ${importInfo.files === 1 ? "PDF" : "PDFs"}`
+    : "";
   const importNote = importInfo
     ? [
-        `Added ${importInfo.added} payments and ${importInfo.credits_added} credits from ${importInfo.files} ${
-          importInfo.files === 1 ? "PDF" : "PDFs"
-        }.`,
+        `Added ${importInfo.added} payments and ${importInfo.credits_added} credits from ${importWhere}.`,
         importInfo.duplicates ? `${importInfo.duplicates} were already in your list and were skipped.` : "",
         importInfo.own_transfers
           ? `${importInfo.own_transfers} transfers between your own accounts were left out.`
@@ -456,6 +516,7 @@ export default function App() {
         importInfo.to_check
           ? `${importInfo.to_check} payments are marked "check" because their category is a guess.`
           : "",
+        importInfo.ignored ? `${importInfo.ignored} messages were not recognised and were left out.` : "",
         importInfo.read < importInfo.expected
           ? `Only ${importInfo.read} of ${importInfo.expected} transactions could be read.`
           : "",
@@ -571,6 +632,11 @@ export default function App() {
               <button className="btn ghost" disabled={busy} onClick={() => pdfRef.current.click()}>
                 Add PDF
               </button>
+              {onAndroidApp && (
+                <button className="btn ghost" disabled={busy} onClick={syncSms}>
+                  Sync SMS
+                </button>
+              )}
               <button className="btn ghost" disabled={busy} onClick={useSample}>
                 Use sample data
               </button>
@@ -760,6 +826,21 @@ export default function App() {
               </p>
             )}
           </section>
+
+          {onAndroidApp && (
+            <section className="section">
+              <h2>Bank SMS</h2>
+              <p className="sub">
+                Read payment alerts from the bank messages on this phone. Only messages that look like bank alerts
+                are sent to be read, and the message text is not stored. Payments already in your list are skipped.
+              </p>
+              <div className="tools">
+                <button className="btn ghost" disabled={busy} onClick={syncSms}>
+                  {busy ? "Reading your messages…" : "Sync SMS"}
+                </button>
+              </div>
+            </section>
+          )}
 
           <section className="section">
             <h2>Transactions</h2>
