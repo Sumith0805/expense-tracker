@@ -4,7 +4,7 @@ from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from auth import current_user
@@ -14,6 +14,7 @@ from ledger import CATEGORIES, CREDIT_CATEGORY, full_response
 router = APIRouter(prefix="/expenses", tags=["expenses"])
 
 MAX_ROWS = 5000
+MAX_ADD = 1000
 
 
 class Row(BaseModel):
@@ -84,6 +85,72 @@ def _as_dict(e: Expense):
         "account": e.account or "",
         "ref": e.ref or "",
     }
+
+
+def new_rows_only(rows, have):
+    """Rows not already saved (same kind and reference) and not repeated inside the batch."""
+    fresh, seen = [], set(have)
+    for r in rows:
+        if r.ref:
+            key = (r.kind, r.ref)
+            if key in seen:
+                continue
+            seen.add(key)
+        fresh.append(r)
+    return fresh
+
+
+@router.post("/add")
+def add_rows(
+    rows: List[Row],
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    """Add payments without touching what is already saved. Used by the phone to upload what it read from SMS."""
+    if len(rows) > MAX_ADD:
+        raise HTTPException(status_code=400, detail=f"Send up to {MAX_ADD} transactions at a time.")
+    for r in rows:
+        check(r)
+    have = {
+        (kind or "expense", ref)
+        for kind, ref in db.execute(
+            select(Expense.kind, Expense.ref).where(Expense.user_id == user.id, Expense.ref != "")
+        ).all()
+    }
+    fresh = new_rows_only(rows, have)
+    total = db.scalar(select(func.count(Expense.id)).where(Expense.user_id == user.id)) or 0
+    if total + len(fresh) > MAX_ROWS:
+        raise HTTPException(status_code=400, detail=f"You can save up to {MAX_ROWS} transactions.")
+    if fresh:
+        db.add_all(
+            [
+                Expense(
+                    user_id=user.id,
+                    date=r.date[:10],
+                    description=r.description[:300],
+                    amount=r.amount,
+                    category=r.category,
+                    kind=r.kind,
+                    account=r.account[:8],
+                    payee=r.payee[:120],
+                    ref=r.ref[:32],
+                )
+                for r in fresh
+            ]
+        )
+        db.commit()
+    return {"added": len(fresh), "skipped": len(rows) - len(fresh)}
+
+
+@router.get("/rows")
+def my_rows(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Everything saved, as plain rows. The phone keeps a copy for offline use."""
+    items = db.scalars(
+        select(Expense).where(Expense.user_id == user.id).order_by(Expense.date)
+    ).all()
+    spend = [_as_dict(e) for e in items if (e.kind or "expense") != "credit"]
+    credits = [_as_dict(e) for e in items if e.kind == "credit"]
+    return {"spend": spend, "credits": credits}
 
 
 @router.get("/analysis")

@@ -16,9 +16,9 @@ import com.getcapacitor.annotation.Permission;
 import java.util.regex.Pattern;
 
 /**
- * Reads bank payment alerts from the SMS inbox.
- * Only messages that mention a debit or credit AND an account or UPI are returned,
- * so chats, OTPs and promotions never leave the phone.
+ * Reads payment alerts from the SMS inbox and hands them to the app, which reads them on the phone.
+ * A message is passed on only if it comes from a sender name (a bank), not a phone number, and it
+ * mentions a money word and an amount. Chats and most promotions never leave this function.
  */
 @CapacitorPlugin(
     name = "SmsReader",
@@ -26,8 +26,11 @@ import java.util.regex.Pattern;
 )
 public class SmsReaderPlugin extends Plugin {
 
-    private static final Pattern MONEY_WORDS = Pattern.compile("(?i)(\\bdebited\\b|\\bcredited\\b|\\bdr\\.)");
-    private static final Pattern BANK_WORDS = Pattern.compile("(?i)(UPI|A/C|Acct)");
+    private static final Pattern MONEY_WORDS = Pattern.compile(
+        "(?i)(\\bdebited\\b|\\bcredited\\b|\\bwithdrawn\\b|\\bspent\\b|\\bpaid\\b|\\bsent\\b|\\breceived\\b"
+        + "|\\bdeposited\\b|\\bpurchase\\b|\\btransferred\\b|\\bdr\\b|\\bcr\\b|\\brefund)");
+    private static final Pattern AMOUNT = Pattern.compile("(?i)(rs\\.?\\s*\\d|inr\\s*\\d|\u20B9\\s*\\d|\\d+\\.\\d{2})");
+    private static final Pattern PHONE_NUMBER = Pattern.compile("^\\+?\\d[\\d\\s-]{6,}$");
     private static final int MAX_BODY = 600;
 
     @PluginMethod
@@ -37,7 +40,7 @@ public class SmsReaderPlugin extends Plugin {
             return;
         }
         int days = call.getInt("days", 90);
-        int limit = call.getInt("limit", 1500);
+        int limit = call.getInt("limit", 3000);
         long since = System.currentTimeMillis() - days * 86400000L;
 
         JSArray out = new JSArray();
@@ -49,11 +52,13 @@ public class SmsReaderPlugin extends Plugin {
                 "date DESC")) {
             if (c != null) {
                 while (c.moveToNext() && out.length() < limit) {
+                    String sender = c.getString(0);
                     String body = c.getString(1);
                     if (body == null) continue;
-                    if (!MONEY_WORDS.matcher(body).find() || !BANK_WORDS.matcher(body).find()) continue;
+                    if (sender != null && PHONE_NUMBER.matcher(sender.trim()).matches()) continue;
+                    if (!MONEY_WORDS.matcher(body).find() || !AMOUNT.matcher(body).find()) continue;
                     JSObject m = new JSObject();
-                    m.put("sender", c.getString(0));
+                    m.put("sender", sender);
                     m.put("body", body.length() > MAX_BODY ? body.substring(0, MAX_BODY) : body);
                     m.put("date", c.getLong(2));
                     out.put(m);

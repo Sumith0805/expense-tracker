@@ -9,6 +9,22 @@ import ManualEntry from "./ManualEntry";
 import Settings from "./Settings";
 import { Back, Chart, Home, Moon, Sliders, Sun } from "./icons";
 import { applyTheme, readPref, resolve } from "./theme";
+import { parseSmsBatch } from "./smsParser";
+import {
+  addPending,
+  addUnread,
+  applyMemory,
+  buildLocalData,
+  clearStore,
+  editCategory,
+  hasData,
+  learnedCategories,
+  loadStore,
+  mergeServer,
+  pendingCount,
+  revertCategory,
+  saveStore,
+} from "./offline";
 
 const CAT_NAMES = Object.keys(CAT_COLORS);
 
@@ -45,6 +61,14 @@ function useRoute() {
 // Reading bank SMS only exists in the Android app. On the website nothing about this shows.
 const SmsReader = registerPlugin("SmsReader");
 const onAndroidApp = Capacitor.getPlatform() === "android";
+const AUTO_KEY = "kharcha-autosync";
+const autoSyncOn = () => {
+  try {
+    return localStorage.getItem(AUTO_KEY) !== "off";
+  } catch {
+    return true;
+  }
+};
 
 export default function App() {
   const [route, go, back] = useRoute();
@@ -112,6 +136,10 @@ export default function App() {
   }, [view, data, session]);
 
   function signOut(msg) {
+    if (onAndroidApp && typeof msg !== "string") {
+      storeRef.current = null;
+      clearStore();
+    }
     setSession(null);
     saveSession(null);
     if (msg !== false) say(typeof msg === "string" ? msg : "You are signed out.");
@@ -170,6 +198,136 @@ export default function App() {
       setBusy(false);
     }
   }
+
+  // ===== Android: bank SMS is read on the phone, kept on the phone, and uploaded when online =====
+  const storeRef = useRef(null);
+  const tokenRef = useRef(token);
+  tokenRef.current = token;
+  const getStore = () => {
+    if (!storeRef.current) storeRef.current = loadStore();
+    return storeRef.current;
+  };
+  const putStore = (next) => {
+    storeRef.current = next;
+    saveStore(next);
+  };
+  const [online, setOnline] = useState(typeof navigator === "undefined" ? true : navigator.onLine);
+  const [unreadN, setUnreadN] = useState(0);
+  const [autoOn, setAutoOn] = useState(autoSyncOn);
+
+  useEffect(() => {
+    if (!onAndroidApp) return undefined;
+    setUnreadN(getStore().unread.length);
+    const goOnline = () => {
+      setOnline(true);
+      uploadPending().then((n) => {
+        if (n > 0) say(`${n} ${n === 1 ? "item was" : "items were"} saved to your account.`);
+      });
+    };
+    const goOffline = () => setOnline(false);
+    window.addEventListener("online", goOnline);
+    window.addEventListener("offline", goOffline);
+    return () => {
+      window.removeEventListener("online", goOnline);
+      window.removeEventListener("offline", goOffline);
+    };
+  }, []);
+
+  // Download a fresh copy of the saved data (keeps changes made on this phone that are not saved yet).
+  async function downloadCopy() {
+    const t = tokenRef.current;
+    if (!onAndroidApp || !t || !navigator.onLine) return { ok: false };
+    try {
+      const fresh = await call("/expenses/rows", { token: t });
+      putStore(mergeServer(getStore(), fresh.spend, fresh.credits));
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, status: e.status };
+    }
+  }
+
+  // Upload payments read from SMS that are waiting. Add-only: nothing already saved is changed.
+  async function uploadPending() {
+    const t = tokenRef.current;
+    if (!onAndroidApp || !t || !navigator.onLine) return 0;
+    const store = getStore();
+    const rows = [
+      ...store.pending.spend.map((r) => ({ ...r, kind: "expense" })),
+      ...store.pending.credits.map((r) => ({ ...r, kind: "credit" })),
+    ];
+    if (!rows.length) return 0;
+    try {
+      for (let i = 0; i < rows.length; i += 1000) {
+        await call("/expenses/add", { method: "POST", body: rows.slice(i, i + 1000), token: t });
+      }
+    } catch {
+      return 0; // stays waiting and is tried again next time
+    }
+    await downloadCopy();
+    return rows.length;
+  }
+
+  // Read the inbox, work out the payments on the phone, keep them, and upload them if online.
+  async function readAndStoreSms(interactive) {
+    let perm = await SmsReader.checkPermissions();
+    if (perm.sms !== "granted") {
+      if (!interactive) return null; // the first sync is the Sync SMS button, which asks for permission
+      perm = await SmsReader.requestPermissions();
+      if (perm.sms !== "granted") {
+        throw new Error(
+          "SMS access was not allowed. On your phone open Settings, Apps, Kharcha, Permissions and allow SMS."
+        );
+      }
+    }
+    const found = await SmsReader.readMessages({ days: 90 });
+    const messages = found.messages || [];
+    const parsed = parseSmsBatch(messages);
+    if (!getStore().serverLoaded) await downloadCopy();
+    const memory = learnedCategories(getStore());
+    const added = addPending(getStore(), applyMemory(parsed.spend, memory), parsed.credits);
+    putStore(addUnread(added.store, parsed.unknown));
+    setUnreadN(getStore().unread.length);
+    const uploaded = await uploadPending();
+    return {
+      checked: messages.length,
+      added: added.added,
+      creditsAdded: added.creditsAdded,
+      duplicates: added.duplicates,
+      unreadable: parsed.unknown.length,
+      toCheck: added.addedRows.filter((r) => ["person", "none", "model"].includes(r.source)).length,
+      uploaded,
+      waiting: pendingCount(getStore()),
+    };
+  }
+
+  // Each time the app opens (signed in, Android, SMS already allowed): read new bank alerts and keep them.
+  // It never asks for permission by itself. The first sync is the Sync SMS button.
+  const autoSynced = useRef(false);
+  useEffect(() => {
+    if (!onAndroidApp || !token || autoSynced.current || !autoSyncOn()) return;
+    autoSynced.current = true;
+    (async () => {
+      try {
+        const r = await readAndStoreSms(false);
+        if (!r) {
+          await uploadPending();
+          return;
+        }
+        const n = r.added + r.creditsAdded;
+        if (n > 0 || r.uploaded > 0) {
+          setData((prev) => prev || buildLocalData(getStore()));
+          const parts = [];
+          if (n > 0) parts.push(`${n} new ${n === 1 ? "payment" : "payments"} read from your bank messages`);
+          if (r.uploaded > 0) parts.push(`${r.uploaded} ${r.uploaded === 1 ? "item" : "items"} saved to your account`);
+          else if (r.waiting > 0) parts.push(`${r.waiting} waiting to be saved when you are online`);
+          say(parts.join(", ") + ".");
+        }
+      } catch {
+        /* quiet on purpose: the Sync SMS button shows any problem */
+      }
+    })();
+  }, [token]);
+
 
   function currentList() {
     return {
@@ -239,51 +397,83 @@ export default function App() {
     if (!onAndroidApp || busy) return;
     setBusy(true);
     setError("");
-    setSlow(false);
-    const timer = setTimeout(() => setSlow(true), 4000);
     try {
-      let perm = await SmsReader.checkPermissions();
-      if (perm.sms !== "granted") perm = await SmsReader.requestPermissions();
-      if (perm.sms !== "granted") {
-        throw new Error(
-          "SMS access was not allowed. On your phone open Settings, Apps, Kharcha, Permissions and allow SMS."
+      const r = await readAndStoreSms(true);
+      const local = buildLocalData(getStore());
+      if (!local.rows && !local.credits.length) {
+        say(
+          r.checked
+            ? "None of your bank messages could be read as payments yet."
+            : "No bank payment messages were found in the last 90 days."
         );
-      }
-      const found = await SmsReader.readMessages({ days: 90 });
-      const messages = found.messages || [];
-      if (!messages.length) {
-        say("No bank payment messages were found in the last 90 days.");
         return;
       }
-      const res = await fetch(`${API}/import/sms`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
-        body: JSON.stringify({ messages, existing: data ? currentList() : null }),
+      setData(local);
+      setImportInfo({
+        source: "sms",
+        files: 1,
+        added: r.added,
+        credits_added: r.creditsAdded,
+        duplicates: r.duplicates,
+        own_transfers: 0,
+        refunded: 0,
+        ignored: r.unreadable,
+        to_check: r.toCheck,
+        read: 0,
+        expected: 0,
+        saved: r.uploaded,
+        waiting: r.waiting,
       });
-      if (!res.ok) {
-        const j = await res.json().catch(() => ({}));
-        throw new Error(typeof j.detail === "string" ? j.detail : "The server could not read those messages.");
-      }
-      const j = await res.json();
-      setData(j);
-      setImportInfo(j.import || null);
       setCat(null);
       setMonth(null);
       setQuery("");
       setOverrides({});
       go("/results");
     } catch (e) {
-      const msg =
-        e.message === "Failed to fetch"
-          ? "Can't reach the analysis server. Check your internet connection and try again."
-          : e.message;
-      setError(msg);
-      say(msg);
+      setError(e.message);
+      say(e.message);
     } finally {
-      clearTimeout(timer);
-      setSlow(false);
       setBusy(false);
     }
+  }
+
+  // Android: open the saved data from the copy on the phone, refreshing it first when online.
+  async function loadSavedLocal() {
+    setBusy(true);
+    let offlineNote = false;
+    if (navigator.onLine && token) {
+      await uploadPending();
+      const got = await downloadCopy();
+      if (!got.ok) {
+        if (got.status === 401) {
+          setBusy(false);
+          signOut("Your session expired. Please sign in again.");
+          go("/account");
+          return;
+        }
+        offlineNote = true;
+      }
+    } else {
+      offlineNote = true;
+    }
+    setBusy(false);
+    const store = getStore();
+    if (!hasData(store)) {
+      say(
+        offlineNote
+          ? "You are offline and nothing is stored on this phone yet. Connect to the internet once to download your saved expenses."
+          : "You haven't saved any expenses yet."
+      );
+      return;
+    }
+    setData(buildLocalData(store));
+    setImportInfo(null);
+    setCat(null);
+    setMonth(null);
+    setQuery("");
+    setOverrides({});
+    go("/results");
+    if (offlineNote) say("You are offline. Showing the copy saved on this phone.");
   }
 
   async function useSample() {
@@ -297,6 +487,7 @@ export default function App() {
   }
 
   async function loadSaved() {
+    if (onAndroidApp) return loadSavedLocal();
     setBusy(true);
     const res = await authed(() => call("/expenses/analysis", { token }));
     setBusy(false);
@@ -315,9 +506,34 @@ export default function App() {
   }
 
   async function saveToAccount() {
-    setSaving(true);
+    let rowsToSave = txns;
+    let creditsToSave = data?.credits || [];
+    if (data?.local) {
+      // Data built on the phone: bring in anything saved elsewhere first, so nothing is overwritten.
+      if (!navigator.onLine) {
+        say("You are offline. Your changes are kept on this phone. Tap Save again when you are connected.");
+        return;
+      }
+      setSaving(true);
+      const got = await downloadCopy();
+      if (!got.ok) {
+        setSaving(false);
+        if (got.status === 401) {
+          signOut("Your session expired. Please sign in again.");
+          go("/account");
+        } else {
+          say("Can't reach the server. Your changes are kept on this phone.");
+        }
+        return;
+      }
+      const merged = buildLocalData(getStore());
+      rowsToSave = merged.transactions;
+      creditsToSave = merged.credits;
+    } else {
+      setSaving(true);
+    }
     const payload = [
-      ...txns.map((t) => ({
+      ...rowsToSave.map((t) => ({
         date: t.date,
         description: String(t.description),
         amount: t.amount,
@@ -327,7 +543,7 @@ export default function App() {
         ref: t.ref || "",
         kind: "expense",
       })),
-      ...(data?.credits || []).map((c) => ({
+      ...creditsToSave.map((c) => ({
         date: c.date,
         description: String(c.description),
         amount: c.amount,
@@ -340,12 +556,24 @@ export default function App() {
     ];
     const res = await authed(() => call("/expenses", { method: "PUT", body: payload, token }));
     setSaving(false);
-    if (res) say(`Saved ${res.saved} transactions to your account.`);
+    if (res) {
+      say(`Saved ${res.saved} transactions to your account.`);
+      if (onAndroidApp) {
+        await downloadCopy();
+        if (data?.local) {
+          setData(buildLocalData(getStore()));
+          setOverrides({});
+        }
+      }
+    }
   }
 
   async function deleteSaved() {
     const res = await authed(() => call("/expenses", { method: "DELETE", token }));
-    if (res) say("Your saved expenses were deleted.");
+    if (res) {
+      if (onAndroidApp) putStore({ ...getStore(), server: { spend: [], credits: [] }, pending: { spend: [], credits: [] } });
+      say("Your saved expenses were deleted.");
+    }
   }
 
   async function deleteAccount() {
@@ -357,7 +585,21 @@ export default function App() {
     }
   }
 
+  function undoAll() {
+    if (data?.local) {
+      let store = getStore();
+      txns
+        .filter((t) => overrides[t._i] !== undefined)
+        .forEach((t) => {
+          store = revertCategory(store, t);
+        });
+      putStore(store);
+    }
+    setOverrides({});
+  }
+
   function changeCat(t, value) {
+    if (data?.local) putStore(editCategory(getStore(), t, value));
     setOverrides((o) => ({ ...o, [t._i]: value }));
     setFlash({ i: t._i, color: CAT_COLORS[value] || "#5a6784" });
     clearTimeout(flashTimer.current);
@@ -500,6 +742,30 @@ export default function App() {
     return Object.entries(m).sort((a, b) => b[1].amt - a[1].amt).slice(0, 8);
   }, [scoped]);
 
+  const waitingN = onAndroidApp ? pendingCount(getStore()) : 0;
+
+  function toggleAuto() {
+    const next = !autoOn;
+    setAutoOn(next);
+    try {
+      localStorage.setItem(AUTO_KEY, next ? "on" : "off");
+    } catch {
+      /* ignore */
+    }
+  }
+
+  async function copyUnread() {
+    const body = getStore()
+      .unread.map((t, i) => `${i + 1}. ${t}`)
+      .join("\n");
+    try {
+      await navigator.clipboard.writeText(body);
+      say("Copied. Long numbers are hidden. Remove any names you do not want to share, then paste it to send it.");
+    } catch {
+      say("Could not copy on this phone.");
+    }
+  }
+
   const importWhere = importInfo
     ? importInfo.source === "sms"
       ? "your bank messages"
@@ -516,7 +782,13 @@ export default function App() {
         importInfo.to_check
           ? `${importInfo.to_check} payments are marked "check" because their category is a guess.`
           : "",
-        importInfo.ignored ? `${importInfo.ignored} messages were not recognised and were left out.` : "",
+        importInfo.saved
+          ? `${importInfo.saved} new ${importInfo.saved === 1 ? "item was" : "items were"} saved to your account.`
+          : "",
+        importInfo.waiting
+          ? `${importInfo.waiting} ${importInfo.waiting === 1 ? "item will" : "items will"} be saved to your account when you are online and signed in.`
+          : "",
+        importInfo.ignored ? `${importInfo.ignored} messages could not be read and were left out.` : "",
         importInfo.read < importInfo.expected
           ? `Only ${importInfo.read} of ${importInfo.expected} transactions could be read.`
           : "",
@@ -590,6 +862,12 @@ export default function App() {
             every transaction into a category and flags the ones that look unusual.
           </p>
 
+          {onAndroidApp && !online && (
+            <p className="note" role="status">
+              You are offline. Your saved expenses and bank messages still work. Uploading, PDF and CSV need
+              internet.
+            </p>
+          )}
           {data && (
             <div className="resume">
               <span>Your last analysis is still loaded ({data.rows} transactions).</span>
@@ -831,14 +1109,33 @@ export default function App() {
             <section className="section">
               <h2>Bank SMS</h2>
               <p className="sub">
-                Read payment alerts from the bank messages on this phone. Only messages that look like bank alerts
-                are sent to be read, and the message text is not stored. Payments already in your list are skipped.
+                Payment alerts from your bank messages are read on this phone, so this works without internet. The
+                message text stays on the phone. {autoOn ? "New alerts are added each time you open the app." : "Automatic sync is off."}
               </p>
               <div className="tools">
                 <button className="btn ghost" disabled={busy} onClick={syncSms}>
                   {busy ? "Reading your messages…" : "Sync SMS"}
                 </button>
+                <button className="btn ghost" onClick={toggleAuto}>
+                  {autoOn ? "Turn off automatic sync" : "Turn on automatic sync"}
+                </button>
+                {unreadN > 0 && (
+                  <button className="btn ghost" onClick={copyUnread}>
+                    Copy {unreadN} {unreadN === 1 ? "message" : "messages"} I could not read
+                  </button>
+                )}
               </div>
+              {!online && (
+                <p className="note" role="status">
+                  You are offline. New payments are kept on this phone and saved to your account when you are back
+                  online.
+                </p>
+              )}
+              {waitingN > 0 && (
+                <p className="note" role="status">
+                  {waitingN} {waitingN === 1 ? "item is" : "items are"} waiting to be saved to your account.
+                </p>
+              )}
             </section>
           )}
 
@@ -872,7 +1169,7 @@ export default function App() {
                 </button>
               )}
               {editedCount > 0 && (
-                <button className="chip" onClick={() => setOverrides({})}>
+                <button className="chip" onClick={undoAll}>
                   Undo category edits
                 </button>
               )}
@@ -948,7 +1245,7 @@ export default function App() {
           hasData={!!data}
           count={data ? data.rows : 0}
           editedCount={editedCount}
-          onUndo={() => setOverrides({})}
+          onUndo={undoAll}
           onExport={exportCsv}
           onClear={clearData}
           session={session}
